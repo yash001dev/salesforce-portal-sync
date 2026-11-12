@@ -100,13 +100,15 @@ only after outages.
 
 **A9. Records created in the portal get their Salesforce ID from Salesforce.**
 The portal creates the record with its own ID and stores the
-Salesforce ID once the create call succeeds. Before retrying a create,
-we must be able to tell whether the first attempt actually succeeded.
-We assume we can set an external-ID field on the Salesforce record
-(our portal ID) and look it up, so a retried create never makes a
-duplicate.
-*If different:* a timeout on a create could leave a duplicate record
-in Salesforce, and we would need a manual de-duplication step.
+Salesforce ID once the create call succeeds.
+*Assumption beyond the brief* (which names only create and update):
+Customer and Contact have an external-ID field holding our portal ID,
+and we can **upsert by that external ID**. Every create is sent as an
+upsert, so if a timed-out create actually landed, the retry updates
+that same record instead of making a second one.
+*If different:* before retrying a create we would have to look the
+record up by external ID (another assumed API), or accept that a
+timeout can leave a duplicate that needs manual de-duplication.
 
 **A10. Webhooks are authenticated.**
 Each webhook carries a signature (shared secret, HMAC over the body)
@@ -127,6 +129,20 @@ not available to us.**
 We assume we cannot read it, so the design does not depend on it.
 *If different:* we could recover intermediate values that we never
 received a webhook for (see the limitation in §7).
+
+**A13. Salesforce delivers webhooks within a few seconds of the edit.**
+Webhook delivery time is outside our control, but it is part of the
+30-second target on the inbound path. We measure it (§3, step 2).
+*If different:* the inbound 30-second target cannot be met by anything
+we build; we can only detect and report it.
+
+**A14. Starting numbers, to be tuned in production.**
+Send at most **80 req/s** (20 below the cap, for safety). **Recovery
+work is guaranteed at least 20% of that (16 req/s)** whenever it has
+work waiting; capacity one class does not use goes to the other. Each
+Salesforce call has a **5-second timeout**. These are configuration
+values, not constants in code.
+*If different:* the budget in §3 changes; the rules do not.
 
 ### 1.2 Questions we would ask before locking the design
 
@@ -153,9 +169,164 @@ received a webhook for (see the limitation in §7).
     request? If so, how many records does a batch count as against the
     cap?
 12. How long must history be kept, and who may read it?
+13. Are the 5 million records already linked on both sides (each
+    portal record knows its Salesforce ID)? If not, the first load
+    must be a bulk import: through the record API at 80 req/s it
+    would take 5,000,000 / 80 = 62,500 s, about 17 hours.
+14. How quickly does Salesforce normally deliver a webhook? (A13)
 
 ## 2. Systems, who calls whom, network boundary, interfaces
 ## 3. Subproblems, in build order
+
+The order follows three questions: what is hardest to change later
+(the data model, and durable writes), what we do not control (inbound
+webhooks), and what spends the scarce resource (calls to Salesforce,
+capped at 100 req/s). Each step adds its own measurement when it is
+built, so we can see each part working before the next one depends on
+it. Measurements are SQL queries on tables we already have (inbox,
+outbox, history), exposed on a `/metrics` endpoint.
+
+### Step 0 (open question): initial load
+Are the 5 million records already linked on both sides? (§1.2 q13.)
+If not, the first load is a one-off bulk import, not the record API,
+which would take about 17 hours. Not part of the build order below.
+
+### Step 1: per-field state and history
+**What:** the record table with the current values and, per field, the
+state from §7 (`sf_time`, version number, `sync_state`,
+`base_sf_time`); the Salesforce-ID ↔ portal-ID mapping; and an
+append-only history table, one row per field change (value, actor,
+time, source).
+**Why first:** every later rule compares an incoming change with this
+state.
+**If skipped:** we would sync whole records, so concurrent edits to
+different fields overwrite each other; and history added later means
+changing every write path. Any history dropped before then counts as
+a lost change.
+
+### Step 2: inbound (webhook → inbox → apply)
+**What:** verify the signature, insert the raw webhook into `inbox`
+with a unique `eventId`, and return 2xx **only after that insert
+commits**. A separate apply step updates each field by the age rule
+(§8), under a row lock (`SELECT … FOR UPDATE`).
+**Rule from day one: applying a webhook never queues a Salesforce
+update.** This is the core of the loop rule (§9).
+**Why before outbound:** it is the input we do not control, and the
+conflict and loop rules depend on it.
+**If skipped:** acknowledging before the commit loses events on a
+crash; without the unique `eventId` a duplicate is applied twice;
+without the age rule an older webhook overwrites newer data.
+**Measures:** age of the oldest unapplied webhook; rejected
+signatures; duplicates dropped; webhook delivery lag (`occurredAt` to
+received time — a clock comparison used only for alerting, never for
+ordering).
+
+### Step 3: outbound (portal save → outbox → worker)
+**What:** a portal save writes the field change, the history row and
+an `outbox` row in **one Postgres transaction**. A worker process
+sends outbox rows to Salesforce.
+- At most one call per record in flight, so two edits to one record
+  cannot reach Salesforce in the wrong order.
+- Pending edits to the same record are merged into one call.
+- Two priorities: **user edits**, and **recovery work** (catch-up
+  reads, sweep, bulk changes).
+- Creates are sent as upserts by external ID (A9).
+**Why here:** it is the only way pending calls survive a restart, and
+the rate limiter (step 4) needs something to control.
+**If skipped:** writing to Postgres and calling Salesforce directly
+means a crash between the two loses the edit, or sends it without
+saving it; during an outage pending calls live only in memory.
+**Measures:** age of the oldest pending user edit (the 30-second
+number); outbox size per priority.
+
+### Step 4: rate limiter and retries
+**What:** one shared limit of 80 req/s for every call we make,
+including retries, reads (A11) and catch-up queries (A3). Recovery is
+guaranteed at least 16 req/s when it has work (A14).
+On timeout or failure: up to **2 quick retries** (after 1 s, then 2 s).
+After that the row stays in the outbox and retries with a growing wait
+(4 s, 8 s … up to 60 s), marked late. Nothing is dropped. On HTTP 429
+we slow down and keep the work.
+**Retry safety.** Updates set fields to fixed values, so sending the
+same update twice leaves the same state. Before every retry we re-run
+§7 rule 1 (cancel if a newer Salesforce value has arrived), and we
+send the *current* pending values, not the original request.
+*Limitation:* if our update landed but the response timed out, and a
+Salesforce user changes the same field before our retry and before
+their webhook reaches us, the retry overwrites their value. This is
+the same blind overwrite described in §7; retries are not completely
+safe.
+**Why here:** with steps 2 and 3 in place, this is the first thing
+that can harm Salesforce itself.
+**If skipped:** retries pile up, we exceed the cap, Salesforce
+throttles us, and throttling causes more retries.
+**Measures:** calls per second against the cap; HTTP 429s and
+timeouts per minute; Salesforce call duration (p95); age of the oldest
+waiting recovery item.
+
+### Step 5: recognising our own write when it comes back
+**What:** the `awaiting_echo` state from §7. The webhook for our own
+write is matched by the integration user (A7) and the values we sent,
+recorded, and never sent back.
+**Why after 2 and 3:** it is about how those two paths interact.
+**If skipped:** step 2's rule already prevents loops, but fields stay
+unconfirmed and rule 3 of §7 has nothing to compare against.
+**Measures:** fields in `awaiting_echo` for more than 5 minutes.
+
+### Step 6: conflict rules (§7)
+**What:** don't send a stale edit; the API response means accepted;
+when the order is unclear, read the record. A few checks inside the
+paths built in steps 2–5.
+**If skipped:** the two sides can show different values, or a portal
+edit silently overwrites a Salesforce edit.
+**Measures:** conflicts per hour.
+
+### Step 7: recovery (sweep, outage catch-up, backlog drain)
+**What:** the drain is the step 3 worker at the step 4 limit. Catch-up
+and the sweep use A3 and A11 and feed results through the **same apply
+path as webhooks** (step 2).
+**Why last:** it reuses everything above; building it first would
+create a second apply path that drifts from the first.
+**If skipped:** Salesforce edits whose webhooks were dropped never
+reach us.
+**Measures:** how far behind the sweep is.
+
+### Step 8: alert thresholds
+Choose, from the measurements above, the three we page on (§11).
+
+### The 30-second target
+30 seconds is a **design target** while both systems are up, not a
+guarantee. Our own outbound steps are budgeted as follows:
+
+| Step | Target | Held by |
+|---|---|---|
+| Save + history + outbox commit | < 0.1 s | one transaction |
+| Worker notices the row | ≤ 1 s | `LISTEN/NOTIFY`, 1 s poll as backup |
+| Earlier call on the same record finishes | ≤ 5 s | one call per record, 5 s timeout |
+| Queue wait | ≤ 5 s | ≥ 64 req/s for user edits, so up to ~320 edits ahead |
+| Call plus 2 quick retries | ≤ 18 s | 5 + 1 + 5 + 2 + 5 |
+| **Total** | **≈ 29 s** | |
+
+At the assumed 10 portal edits/s the queue is nearly always empty, so
+the realistic worst case for our steps is about 24 s. Inbound adds
+Salesforce's webhook delivery time (A13), which we do not control;
+our part (verify, store, apply) is about 1 s, plus up to 5 s if §7
+rule 3 needs a read.
+
+**When the target can be missed, and how we see it:**
+
+| Case | Measured by |
+|---|---|
+| More user edits queued than we can send in time | oldest pending user edit: warn at 20 s, page at 30 s |
+| Salesforce answers slowly | call duration p95: warn above 2 s |
+| Timeouts or HTTP 429 push past the quick retries | timeouts and 429s per minute |
+| Salesforce delivers webhooks late | webhook delivery lag: warn above 10 s |
+| Draining the backlog after an outage | separate target (§10); backlog size over time |
+
+During a drain, queued portal edits are sent oldest first; a new edit
+to a record already queued merges into that item, and a new edit to
+any other record waits its turn. The 30-second target is suspended
+until the backlog is gone.
 ## 4. Data we store
 ## 5. Inbound path: webhook → Postgres
 ## 6. Outbound path: portal edit → Salesforce API
@@ -233,6 +404,13 @@ none of which the brief gives us:
   including Delhi;
 - Salesforce field history (A12), which keeps every value of the
   field.
+
+The same limitation applies to **retries** (§3, step 4). If our update
+lands but the response times out, and a Salesforce user changes the
+same field before our retry and before their webhook reaches us, the
+retry overwrites their value. Rule 1 runs before every retry, so it
+catches this only if their webhook has already arrived.
+
 ## 8. Rule: duplicate and out-of-order webhooks
 ## 9. Rule: stopping the sync loop
 ## 10. The 6-hour outage and the arithmetic
