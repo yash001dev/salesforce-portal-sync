@@ -144,6 +144,19 @@ Salesforce call has a **5-second timeout**. These are configuration
 values, not constants in code.
 *If different:* the budget in §3 changes; the rules do not.
 
+**A15. We can get the client's Salesforce validation rules and allowed
+values.**
+The Portal API checks the rules we know about before saving
+(phone and email format, required fields, allowed `status` values,
+`owner` is a known Salesforce user, a contact's customer exists) and
+returns `422` with an error per field. We keep these rules in a
+config file. They reduce rejections; they do not remove them, because
+some Salesforce rejections depend on things we cannot check
+(permissions, rules that look at other data, rules changed without
+notice).
+*If different:* more edits reach Salesforce and come back `rejected`
+(§3 step 4). Nothing is lost; users just see the error later.
+
 ### 1.2 Questions we would ask before locking the design
 
 1. What are the real peak and quiet-hour edit rates on each side? (A1)
@@ -174,8 +187,156 @@ values, not constants in code.
     must be a bulk import: through the record API at 80 req/s it
     would take 5,000,000 / 80 = 62,500 s, about 17 hours.
 14. How quickly does Salesforce normally deliver a webhook? (A13)
+15. Can we get the current Salesforce validation rules and allowed
+    values, and who tells us when they change? (A15)
 
 ## 2. Systems, who calls whom, network boundary, interfaces
+
+### 2.1 Shape
+
+One service, two processes, one database. **The two processes share
+nothing but Postgres.** Nothing passes between them in memory; a
+Postgres `NOTIFY` only wakes the worker early, and a 1-second poll
+finds the work if a notify is missed.
+
+```
+                 ┌──────────────── our service ─────────────────┐
+ Salesforce ───► │ API process                                   │
+  (webhook)      │  POST /webhooks/salesforce ──► inbox          │
+ Portal user ──► │  PATCH /records/:type/:id  ──► record,        │
+  (save)         │                               history, outbox │
+                 │                         Postgres              │
+                 │ Worker process             ▲                  │
+                 │  applies inbox ────────────┤                  │
+                 │  sends outbox ─────────────┴── HTTPS ─────────┼──► Salesforce record API
+                 └───────────────────────────────────────────────┘
+```
+
+| Caller → callee | Path | Crosses the public internet |
+|---|---|---|
+| Salesforce → API process | webhook over HTTPS | yes |
+| Portal user → API process | portal save over HTTPS | yes |
+| Worker → Salesforce | record API over HTTPS, rate-limited (§3 step 4) | yes |
+| API process ↔ worker | Postgres tables (`inbox`, `outbox`) | no |
+
+A sales user talks only to Salesforce; a portal user talks only to the
+portal.
+
+**No Kafka or Redis.** Peak traffic is about 30 events/s, and a
+6-hour outage leaves about 216,000 outbox rows; Postgres handles both.
+The outbox works *because* the queue entry and the data are written in
+one transaction; a separate queue service would bring back the
+dual-write problem. Postgres already gives us what a queue needs:
+`FOR UPDATE SKIP LOCKED` to claim rows, `LISTEN/NOTIFY` to wake the
+worker, unique constraints for duplicates. The rate limiter lives in
+the single worker's memory. If we later run several workers, the
+shared limiter is a small token table in Postgres first.
+
+### 2.2 Inbound: Salesforce change → portal
+
+API process:
+1. Salesforce calls `POST /webhooks/salesforce`.
+2. Verify the signature (A10); check object type and field names.
+3. Insert into `inbox` keyed by `eventId` (`ON CONFLICT DO NOTHING`);
+   commit.
+4. Reply `200`, also for a duplicate, then `NOTIFY`.
+
+Worker, in **one transaction**:
+1. Claim one unapplied inbox row (`FOR UPDATE SKIP LOCKED`).
+2. Lock the record row (`SELECT … FOR UPDATE`).
+3. Per field: age rule (§8), own-write match (§3 step 5, §9), conflict
+   rules (§7).
+4. Write history rows; update field state; mark the inbox row
+   applied.
+5. **Never write to the outbox.**
+
+Any failure rolls the whole transaction back and the inbox row is
+tried again.
+
+### 2.3 Outbound: portal save → Salesforce
+
+API process, in **one transaction**:
+1. Actor from the login session (A5).
+2. Check known Salesforce rules (A15); a failure returns `422` and
+   nothing is saved.
+3. Lock the record row; version check per field (A4); a stale field
+   returns `409`.
+4. Set the fields to `pending`, write history rows, write or merge the
+   record's pending outbox row.
+
+Commit, then `NOTIFY`.
+
+Worker:
+1. **Claim (short transaction).** Pick an outbox row whose record has
+   no call in flight; user edits first, recovery guaranteed 20%
+   (A14). Take a rate-limit slot. Mark the row in flight with a lease
+   ("mine until now + 30 s"). Commit.
+2. **Call Salesforce outside any transaction.** We never hold a
+   database transaction open across an HTTP call. Re-run §7 rule 1
+   first.
+3. **Record the result (new transaction).**
+   - Success: fields still holding the sent value become `synced`
+     with `sf_time = NULL`; the outbox row is done.
+   - Timeout, `5xx`, `429`: attempt count + 1, next attempt time set,
+     lease released.
+   - Other `4xx`: fields become `rejected`; the row stops (§3 step 4).
+
+The webhook for our own write later arrives on the inbound path and
+fills in `sf_time` (§3 step 5).
+
+### 2.4 Why inbox and outbox are separate
+
+| | inbox | outbox |
+|---|---|---|
+| Holds | what Salesforce told us | what we must tell Salesforce |
+| Key | `eventId` (unique: catches duplicates) | record: one in flight + one pending (merges edits) |
+| Written by | the webhook endpoint | a portal save, in the same transaction as the data |
+| Limited by | nothing (webhooks are outside the cap) | 80 req/s, recovery share (A14) |
+| Retry means | re-run a local transaction | growing wait, lease, re-check §7 rule 1 |
+| Afterwards | kept as a raw record of what Salesforce sent | removed or archived |
+
+Without the inbox we would have to apply before replying: a bug or a
+slow lock becomes an error, Salesforce resends, and eventually gives
+up. Without the outbox, "saved in Postgres" and "will be sent" cannot
+happen together.
+
+### 2.5 What a crash does
+
+| Crash point | What happens | Change lost? |
+|---|---|---|
+| API, before the inbox commit | no `200`; Salesforce resends (A8); the sweep catches it if Salesforce gives up | no |
+| API, after the commit, before the `200` | Salesforce resends; duplicate `eventId` ignored; `200` | no |
+| API, during a portal save | transaction rolls back; the user sees an error | no |
+| Worker, while applying | rolls back; inbox row still unapplied; tried again | no |
+| Worker, before the Salesforce call | lease runs out; row retried | no |
+| Worker, after sending the call, before recording the result | lease runs out; call retried, as for a timeout | no, but the retry can overwrite an unseen Salesforce edit (§3 step 4, §7) |
+| Postgres down | webhooks get `503` (Salesforce resends); portal saves fail visibly; worker waits | no, while Salesforce keeps resending |
+
+Postgres is the one part everything depends on. Managed Postgres with
+automatic failover covers that; it is outside this weekend's scope.
+
+### 2.6 Interfaces
+
+**Webhook endpoint** (Salesforce calls us)
+`POST /webhooks/salesforce`, a signature header (A10), body as in the
+brief's sample. Responses: `200` stored or duplicate · `401` bad
+signature · `400` malformed · `503` database down, please retry.
+
+**Portal save** (portal user calls us)
+`PATCH /records/:type/:id`, body `changedFields` plus, per field, the
+version the user loaded. The actor comes from the session; a body
+`editedBy` is only checked to match. Responses: `200` with new
+versions · `409` per stale field, with its current value and actor ·
+`422` per field breaking a known Salesforce rule (A15).
+
+**Salesforce record API** (we call Salesforce)
+- update: changed fields only;
+- create: upsert by external ID (A9);
+- read one record by ID (A11);
+- records modified since a time (A3).
+
+Responses: `2xx` done · `429` slow down, keep the work · timeout or
+`5xx` retry · other `4xx` rejected, no retry.
 ## 3. Subproblems, in build order
 
 The order follows three questions: what is hardest to change later
@@ -193,8 +354,8 @@ which would take about 17 hours. Not part of the build order below.
 
 ### Step 1: per-field state and history
 **What:** the record table with the current values and, per field, the
-state from §7 (`sf_time`, version number, `sync_state`,
-`base_sf_time`); the Salesforce-ID ↔ portal-ID mapping; and an
+state from §7 (`sf_time`, version number, `sync_state` =
+`pending` / `synced` / `rejected`, `base_sf_time`); the Salesforce-ID ↔ portal-ID mapping; and an
 append-only history table, one row per field change (value, actor,
 time, source).
 **Why first:** every later rule compares an incoming change with this
@@ -227,7 +388,10 @@ an `outbox` row in **one Postgres transaction**. A worker process
 sends outbox rows to Salesforce.
 - At most one call per record in flight, so two edits to one record
   cannot reach Salesforce in the wrong order.
-- Pending edits to the same record are merged into one call.
+- Pending edits to the same record are merged into one call. A row
+  already in flight is never changed; a new save adds one pending row
+  behind it. So each record has at most one row in flight and one
+  pending.
 - Two priorities: **user edits**, and **recovery work** (catch-up
   reads, sweep, bulk changes).
 - Creates are sent as upserts by external ID (A9).
@@ -247,6 +411,13 @@ On timeout or failure: up to **2 quick retries** (after 1 s, then 2 s).
 After that the row stays in the outbox and retries with a growing wait
 (4 s, 8 s … up to 60 s), marked late. Nothing is dropped. On HTTP 429
 we slow down and keep the work.
+**Permanent rejection.** A `4xx` other than 429 (for example a
+Salesforce validation rule refusing a phone format) will not succeed
+on retry. The field becomes `rejected`, the outbox row stops, and the
+portal shows the user Salesforce's error so they can correct it; their
+correction is a normal new edit. We never undo the portal value
+automatically. Until it is corrected, the two sides differ on that
+field, and the field is visibly marked.
 **Retry safety.** Updates set fields to fixed values, so sending the
 same update twice leaves the same state. Before every retry we re-run
 §7 rule 1 (cancel if a newer Salesforce value has arrived), and we
@@ -262,19 +433,23 @@ that can harm Salesforce itself.
 throttles us, and throttling causes more retries.
 **Measures:** calls per second against the cap; HTTP 429s and
 timeouts per minute; Salesforce call duration (p95); age of the oldest
-waiting recovery item.
+waiting recovery item; rejections per hour (each one is investigated:
+it may be an outdated rule copy, A15, or a cause we cannot check, such
+as permissions or a rule that depends on other data).
 
 ### Step 5: recognising our own write when it comes back
-**What:** the `awaiting_echo` state from §7. The webhook for our own
-write is matched by the integration user (A7) and the values we sent,
-recorded, and never sent back.
+**What:** the webhook for our own write is matched by the integration
+user (A7) and the values we sent. It fills in the field's `sf_time`
+(NULL since the API response, §7 rule 2), is recorded, and is never
+sent back.
 **Why after 2 and 3:** it is about how those two paths interact.
-**If skipped:** step 2's rule already prevents loops, but fields stay
-unconfirmed and rule 3 of §7 has nothing to compare against.
-**Measures:** fields in `awaiting_echo` for more than 5 minutes.
+**If skipped:** step 2's rule already prevents loops, but `sf_time`
+stays NULL, so every later different value costs a read (§7 rule 3).
+**Measures:** synced fields whose `sf_time` has been NULL for more
+than 5 minutes.
 
 ### Step 6: conflict rules (§7)
-**What:** don't send a stale edit; the API response means accepted;
+**What:** don't send a stale edit; the API response means synced;
 when the order is unclear, read the record. A few checks inside the
 paths built in steps 2–5.
 **If skipped:** the two sides can show different values, or a portal
@@ -347,8 +522,8 @@ compare our clock with Salesforce's (A6). Instead, each field keeps:
 | Field state | Meaning |
 |---|---|
 | `value` | current value in the portal |
-| `sf_time` | Salesforce `occurredAt` of the last Salesforce value we applied |
-| `sync_state` | `synced`, `pending` (not yet accepted by Salesforce) or `awaiting_echo` (accepted, our own webhook not seen yet) |
+| `sf_time` | Salesforce time (`occurredAt`) of the current value. **NULL** after our own write is accepted, until the webhook for that write tells us its Salesforce time |
+| `sync_state` | `pending` (not yet accepted by Salesforce), `synced` (accepted), or `rejected` (Salesforce refused it permanently, §3 step 4) |
 | `base_sf_time` | for a pending edit: the `sf_time` the user saw when they edited |
 
 Three rules:
@@ -360,20 +535,30 @@ Three rules:
    value goes into history, and the field is flagged as a conflict
    for the portal user. The same check runs again just before the
    call is sent.
-2. **The API response means accepted.** When the update call succeeds,
-   the field moves to `awaiting_echo`. When the webhook for our own
-   write arrives (§9), we record its `occurredAt` as `sf_time`, move
-   to `synced`, and never send it back. The portal does not show the
-   edit as pending while it waits for that webhook.
-3. **When the order is unclear, ask Salesforce.** If a webhook with a
-   *different* value arrives for a field in `awaiting_echo`, we cannot
-   tell whether it came before or after our write. We read the record
-   (A11) and take Salesforce's current value. Both values go into
-   history. If our own webhook never arrives, the periodic sweep (A3)
-   moves the field to `synced` once Salesforce's value matches ours.
+2. **The API response means synced.** When the update call succeeds,
+   the field becomes `synced` with `sf_time = NULL`. When the webhook
+   for our own write arrives (§9), we fill in `sf_time` from its
+   `occurredAt` and never send it back. Nothing else changes; the
+   portal shows the edit as synced from the API response onward. If
+   that webhook never arrives, `sf_time` simply stays NULL; the only
+   cost is that a later different value for that field triggers
+   rule 3.
+3. **When the order is unclear, read the record.** If a webhook with a
+   *different* value arrives for a field whose `sf_time` is NULL, we
+   cannot tell whether it came before or after our write. We read the
+   record (A11) and take Salesforce's current value. Both values go
+   into history, with their relative order recorded as **unknown**.
 
-Rule 3 makes both sides converge: the portal always ends up with the
-value Salesforce holds.
+Rule 3 makes both sides converge: the portal ends up with the value
+Salesforce holds.
+
+**What a read does not give us.** A read returns Salesforce's *current*
+value. It does not tell us the order in which the competing edits
+happened, and it does not return values that were set and overwritten
+in between. So rule 3 restores agreement between the two sides, not
+complete history: values we received a webhook for are in history
+(order possibly unknown); values we never received are missing (see
+the limitation below).
 
 **Worked example.** A finance user sets city to Noida. A sales user
 sets city to Delhi at about the same time.
@@ -383,9 +568,10 @@ sets city to Delhi at about the same time.
   sees a conflict.
 - *Delhi is saved in Salesforce, but its webhook arrives after Noida
   is sent.* Salesforce now holds Noida (last write wins there). Delhi's
-  webhook arrives while the field is `awaiting_echo`, so rule 3 reads
-  the record: Noida. Delhi is recorded in history, and the field is
-  flagged as a conflict.
+  webhook arrives while the field's `sf_time` is NULL, so rule 3 reads
+  the record: Noida. Delhi is recorded in history, the order of Delhi
+  and Noida is recorded as unknown, and the field is flagged as a
+  conflict.
 
 **Limitation: a blind overwrite can lose a value from our history.**
 In the second case above, Delhi reaches our history *only because its
