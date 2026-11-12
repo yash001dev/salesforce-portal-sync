@@ -87,8 +87,9 @@ showing different values.
 Every write we make to Salesforce is made as `integration@…`, so the
 webhook Salesforce sends back for our own write has
 `changedBy = integration@…`.
-*If different:* we recognise our own echoes only by matching the
-webhook against the log of what we sent (§9). This still works but is
+*If different:* we recognise our own echoes only by the write ID
+(A16), or, without it, by matching the webhook against what we sent
+(§9). This still works but is
 harder to make airtight.
 
 **A8. Salesforce retries failed webhooks for a limited time, then gives up.**
@@ -157,6 +158,23 @@ notice).
 *If different:* more edits reach Salesforce and come back `rejected`
 (§3 step 4). Nothing is lost; users just see the error later.
 
+**A16. A write ID on every update we send.**
+*Assumption beyond the brief:* Customer and Contact have a custom
+field `Portal_Write_Id__c`. Every update or upsert we send sets it to
+a new unique ID. Because the field changes on every write we make,
+Salesforce includes it in `changedFields` of the webhook for that
+write. This is a field we add to the webhook payload, and the reason
+is exact matching: the webhook for our own write tells us *which* of
+our writes it is, even when several writes to one record happen close
+together or the same value is sent twice. Sales users never change
+this field, so their webhooks do not carry it. It is never shown in
+the portal or treated as a synced field.
+*If different (Option B):* we match our own webhook by integration
+user (A7) and value. If a field is sent again before the webhook for
+its previous write arrived, the match is ambiguous, so we leave that
+field's `sf_time` NULL. NULL is always safe: a later different value
+then costs one read (§7 rule 3).
+
 ### 1.2 Questions we would ask before locking the design
 
 1. What are the real peak and quiet-hour edit rates on each side? (A1)
@@ -189,6 +207,8 @@ notice).
 14. How quickly does Salesforce normally deliver a webhook? (A13)
 15. Can we get the current Salesforce validation rules and allowed
     values, and who tells us when they change? (A15)
+16. Can the client add a `Portal_Write_Id__c` field to Customer and
+    Contact, and will its changes appear in webhooks? (A16)
 
 ## 2. Systems, who calls whom, network boundary, interfaces
 
@@ -261,35 +281,46 @@ API process, in **one transaction**:
    nothing is saved.
 3. Lock the record row; version check per field (A4); a stale field
    returns `409`.
-4. Set the fields to `pending`, write history rows, write or merge the
-   record's pending outbox row.
+4. Set the fields to `pending`, write history rows, and make sure the
+   record has an outbox row (create it, or set `again` if it is in
+   flight). The outbox row holds no values.
+5. Placeholder customers (§4) cannot be edited until they are
+   complete; the API returns `409`.
 
 Commit, then `NOTIFY`.
 
 Worker:
-1. **Claim (short transaction).** Pick an outbox row whose record has
-   no call in flight; user edits first, recovery guaranteed 20%
-   (A14). Take a rate-limit slot. Mark the row in flight with a lease
-   ("mine until now + 30 s"). Commit.
+1. **Claim (short transaction).** Pick a pending outbox row; user
+   edits first, recovery guaranteed 20% (A14). Skip a contact whose
+   customer has no Salesforce ID yet (it waits for the customer's own
+   create). Take a rate-limit slot. Read the record's **current**
+   pending fields and store exactly what will be sent on the row:
+   `sent = {field: {version, value}}` and a new write ID (A16). Mark
+   the row in flight with a lease ("mine until now + 30 s"). Commit.
 2. **Call Salesforce outside any transaction.** We never hold a
    database transaction open across an HTTP call. Re-run §7 rule 1
-   first.
+   first. The call sets the sent fields and `Portal_Write_Id__c`.
 3. **Record the result (new transaction).**
-   - Success: fields still holding the sent value become `synced`
-     with `sf_time = NULL`; the outbox row is done.
+   - Success: each sent field whose version still equals its sent
+     version becomes `synced`, with `sf_time = NULL` and the write ID
+     stored. A field edited during the call stays `pending`. If
+     `again` is set, the row goes back to pending; otherwise it is
+     deleted.
    - Timeout, `5xx`, `429`: attempt count + 1, next attempt time set,
-     lease released.
-   - Other `4xx`: fields become `rejected`; the row stops (§3 step 4).
+     lease released. The next attempt takes a fresh snapshot and a
+     new write ID.
+   - Other `4xx`: the sent fields become `rejected`; the row stops
+     (§3 step 4).
 
-The webhook for our own write later arrives on the inbound path and
-fills in `sf_time` (§3 step 5).
+The webhook for our own write later arrives on the inbound path and,
+if its write ID matches, fills in `sf_time` (§3 step 5).
 
 ### 2.4 Why inbox and outbox are separate
 
 | | inbox | outbox |
 |---|---|---|
 | Holds | what Salesforce told us | what we must tell Salesforce |
-| Key | `eventId` (unique: catches duplicates) | record: one in flight + one pending (merges edits) |
+| Key | `eventId` (unique: catches duplicates) | record: one row per record, holding no values (merges edits) |
 | Written by | the webhook endpoint | a portal save, in the same transaction as the data |
 | Limited by | nothing (webhooks are outside the cap) | 80 req/s, recovery share (A14) |
 | Retry means | re-run a local transaction | growing wait, lease, re-check §7 rule 1 |
@@ -380,7 +411,7 @@ without the age rule an older webhook overwrites newer data.
 **Measures:** age of the oldest unapplied webhook; rejected
 signatures; duplicates dropped; webhook delivery lag (`occurredAt` to
 received time — a clock comparison used only for alerting, never for
-ordering).
+ordering); placeholder customers older than 5 minutes (§4).
 
 ### Step 3: outbound (portal save → outbox → worker)
 **What:** a portal save writes the field change, the history row and
@@ -388,10 +419,12 @@ an `outbox` row in **one Postgres transaction**. A worker process
 sends outbox rows to Salesforce.
 - At most one call per record in flight, so two edits to one record
   cannot reach Salesforce in the wrong order.
-- Pending edits to the same record are merged into one call. A row
-  already in flight is never changed; a new save adds one pending row
-  behind it. So each record has at most one row in flight and one
-  pending.
+- One outbox row per record. It holds no values: the worker reads the
+  record's current pending fields when it sends, so several saves
+  merge into one call automatically. A save during an in-flight call
+  sets `again`, and the row goes back to pending once the call ends.
+  The worker records exactly what it sent (§2.3). Merging never
+  touches history: each save writes its own history rows (§4).
 - Two priorities: **user edits**, and **recovery work** (catch-up
   reads, sweep, bulk changes).
 - Creates are sent as upserts by external ID (A9).
@@ -438,10 +471,12 @@ it may be an outdated rule copy, A15, or a cause we cannot check, such
 as permissions or a rule that depends on other data).
 
 ### Step 5: recognising our own write when it comes back
-**What:** the webhook for our own write is matched by the integration
-user (A7) and the values we sent. It fills in the field's `sf_time`
-(NULL since the API response, §7 rule 2), is recorded, and is never
-sent back.
+**What:** the webhook for our own write is matched by its write ID
+(A16). For each field still at the version we sent with that ID, it
+fills in `sf_time` (NULL since the API response, §7 rule 2). A webhook
+with an older write ID changes no state. It is kept in the inbox and
+never sent back. Without the write ID we use Option B (A16): match by
+value, and leave `sf_time` NULL when unsure.
 **Why after 2 and 3:** it is about how those two paths interact.
 **If skipped:** step 2's rule already prevents loops, but `sf_time`
 stays NULL, so every later different value costs a read (§7 rule 3).
@@ -503,6 +538,132 @@ to a record already queued merges into that item, and a new edit to
 any other record waits its turn. The 30-second target is suspended
 until the backlog is gone.
 ## 4. Data we store
+
+Seven tables, all in Postgres.
+
+```
+customer ─┐                      ┌─ field_state    sync state, one row per (record, field)
+contact  ─┼── record_id (uuid) ──┼─ field_history  append-only, one row per change
+          │                      └─ outbox         one row per record with something to send
+          └─ contact.customer_id → customer.id
+inbox        raw webhooks, keyed by eventId
+sync_cursor  how far the sweep / catch-up has read
+```
+
+### 4.1 Tables
+
+**`customer`**: current values the portal reads.
+`id` (uuid, ours), `sf_id` (unique, NULL until created in
+Salesforce), `name`, `status`, `owner`, `is_placeholder` (bool).
+
+**`contact`**: current values.
+`id`, `sf_id`, `full_name`, `phone`, `email`, `city`, `owner`,
+`customer_id` (foreign key to `customer.id`).
+The link uses *our* customer ID, which always exists. The worker sends
+it to Salesforce as the customer's `sf_id`; a contact whose customer
+has no `sf_id` yet waits until the customer's create succeeds (§2.3).
+
+**`field_state`**: the per-field state from §7, one row per
+(record, field). Key `(record_id, field)`.
+`version`, `sf_time` (NULL allowed), `sync_state` (`pending` /
+`synced` / `rejected`), `base_sf_time`, `conflict` (bool),
+`sent_version`, `sent_write_id`.
+This is a table rather than jsonb on the record row so that the
+measurements in §3 are plain indexed queries. At about 7 fields per
+record that is about 35 million small rows. The record's row lock
+still covers it.
+
+**`field_history`**: every change, never updated or deleted.
+`id`, `record_id`, `field`, `old_value`, `new_value`, `actor`,
+`source` (`portal` / `salesforce` / `read`), `sf_time`, `recorded_at`
+(`clock_timestamp()`, display only), `version`, `event_id`, `outcome`.
+Index `(record_id, field, id)`.
+
+**`inbox`**: what Salesforce sent us.
+`event_id` (primary key: catches duplicates), `payload` (jsonb),
+`received_at`, `applied_at`, `attempts`, `last_error`.
+
+**`outbox`**: "this record has something to send". Key
+`(record_id, kind)`, where `kind` is `write` or `read`.
+`priority` (`user` / `recovery`), `state` (`pending` / `in_flight`),
+`again` (bool), `sent` (jsonb: `{field: {version, value}}` and the
+write ID, set at claim), `attempts`, `next_attempt_at`, `lease_until`,
+`last_error`. It holds no values while pending.
+
+**`sync_cursor`**: `name`, `value`. Where the sweep and outage
+catch-up have read up to, so a restart resumes there.
+
+Not stored: a log of each retry attempt (the count is on the outbox
+row); rate-limiter state (in the worker's memory); validation rules (a
+config file, A15).
+
+### 4.2 History rules
+
+1. **Each portal save writes its own history rows**, one per changed
+   field, in the same transaction as the save. The worker never
+   writes portal history.
+2. **The outbox holds no values, so merging has nothing to drop.** It
+   only decides how many calls reach Salesforce.
+3. **`field_history` is append-only.** The service's database role has
+   `INSERT` and `SELECT` on it, never `UPDATE` or `DELETE`.
+4. **`outcome` is decided when the row is written and never changes.**
+   A later event adds a new row.
+
+| `outcome` | Meaning | `old_value` |
+|---|---|---|
+| `applied` | became the current value | the value it replaced |
+| `superseded` | a real Salesforce edit that arrived after a newer one; order reliable (§7) | NULL |
+| `order_unknown` | a Salesforce edit whose order against ours we cannot establish (§7 rule 3) | NULL |
+| `conflict` | a Salesforce value that replaced a pending portal edit (§7 rule 1) | the cancelled portal value |
+| `rejected` | a value Salesforce refused; `new_value` is exactly what we sent (from `outbox.sent`) | NULL |
+
+Our own write coming back from Salesforce adds **no** history row: it
+is not a new edit. The raw webhook stays in the inbox.
+
+One consequence for the client: when a user saves twice before the
+first is sent, Salesforce receives only the latest value. Our history
+has both; Salesforce's own history would show only the last.
+
+### 4.3 Placeholder customers
+
+A contact's webhook can name a customer we do not have yet. We create
+a **placeholder** customer with only its `sf_id`, link the contact to
+it, and queue a recovery read (A11) for the real values.
+
+- `is_placeholder = true`. Required fields may be NULL only on a
+  placeholder:
+  `CHECK (is_placeholder OR (name IS NOT NULL AND status IS NOT NULL))`
+  (and any other fields A15 makes required).
+- A placeholder has no `field_state` rows and never gets an outbox
+  write: there is nothing of ours to send.
+- The portal shows it as "loading from Salesforce" and refuses edits
+  to it (`409`) until it is complete.
+- The read's values go through the normal apply path (source `read`),
+  then `is_placeholder` becomes false.
+- Measured: placeholders older than 5 minutes (§3 step 2).
+
+### 4.4 Example: one contact
+
+Contact `c-42`, Salesforce ID `0031A00000Abc`. Start: city Mumbai
+(version 3, `sf_time` 11:00:00, synced); phone with `sf_time`
+10:00:00.
+
+| # | Event | What is saved |
+|---|---|---|
+| 1 | Finance user sets city to **Noida** (11:30:02) | `contact.city` = Noida. `field_state` city: version 4, `pending`, `base_sf_time` 11:00:00. History #101: Mumbai → Noida, finance user, portal, `applied`. Outbox row created (write, user, pending) |
+| 2 | Same user sets city to **Gurgaon** before anything is sent | version 5. History #102: Noida → Gurgaon, `applied`. Outbox row already pending: unchanged. *One future call, two history rows.* |
+| 3 | Worker claims the row | Outbox: `in_flight`, `sent` = {city: v5 Gurgaon}, write ID W1, lease. Sends city = Gurgaon, `Portal_Write_Id__c` = W1 |
+| 4 | Call times out | Outbox: attempts 1, next attempt in 1 s. *No history row: a retry is not an edit.* |
+| 5 | Retry | Rule 1 re-checked. Fresh snapshot: still v5 Gurgaon; write ID W2. **Success.** city: `synced`, `sf_time` NULL, `sent_version` 5, `sent_write_id` W2. Outbox row deleted |
+| 6 | Webhook `evt_1001`: sales user sets phone (11:30:04) | Inbox row; `200`. Applied: phone's `sf_time` 10:00 is older, so phone updates. History #103: old → new phone, sales user, salesforce, `sf_time` 11:30:04, `evt_1001`, `applied`. *City untouched.* |
+| 7 | `evt_1001` again | Inbox insert does nothing; `200`. Nothing else written |
+| 8 | Webhook for attempt 1 (write ID W1, 11:30:08) | W1 ≠ `sent_write_id` W2: no state change, no history row. Kept in inbox |
+| 9 | Webhook for attempt 2 (W2, 11:30:09) | W2 matches and city is still version 5: `sf_time` = 11:30:09. No history row |
+| 10 | Late webhook `evt_0999`: sales user set city to Pune (11:29:50) | `sf_time` 11:30:09 is known and later: History #104: Pune, sales user, `sf_time` 11:29:50, **`superseded`**, `old_value` NULL. Current value stays Gurgaon |
+
+End state: the contact shows Gurgaon and the new phone; history has
+Noida, Gurgaon, the phone change and Pune, each with who and when; the
+outbox is empty; the inbox has four rows (the duplicate added none).
 ## 5. Inbound path: webhook → Postgres
 ## 6. Outbound path: portal edit → Salesforce API
 ## 7. Rule: both sides change the same record
@@ -531,14 +692,15 @@ Three rules:
 1. **Don't send a stale edit.** If a Salesforce value arrives for a
    field that is `pending`, with `occurredAt` newer than the edit's
    `base_sf_time`, the portal edit was made without seeing it. We
-   cancel the send. The Salesforce value becomes current, the portal
-   value goes into history, and the field is flagged as a conflict
-   for the portal user. The same check runs again just before the
+   cancel the send. The Salesforce value becomes current; its history
+   row has outcome `conflict` and `old_value` = the cancelled portal
+   value (whose own history row, written at save time, stays as it
+   is). The field is flagged as a conflict for the portal user. The same check runs again just before the
    call is sent.
 2. **The API response means synced.** When the update call succeeds,
    the field becomes `synced` with `sf_time = NULL`. When the webhook
-   for our own write arrives (§9), we fill in `sf_time` from its
-   `occurredAt` and never send it back. Nothing else changes; the
+   for our own write arrives (§9), matched by its write ID (A16), we
+   fill in `sf_time` from its `occurredAt` and never send it back. Nothing else changes; the
    portal shows the edit as synced from the API response onward. If
    that webhook never arrives, `sf_time` simply stays NULL; the only
    cost is that a later different value for that field triggers
@@ -546,8 +708,15 @@ Three rules:
 3. **When the order is unclear, read the record.** If a webhook with a
    *different* value arrives for a field whose `sf_time` is NULL, we
    cannot tell whether it came before or after our write. We read the
-   record (A11) and take Salesforce's current value. Both values go
-   into history, with their relative order recorded as **unknown**.
+   record (A11) and take Salesforce's current value. If the read
+   shows the webhook's value, it is recorded as `applied`; otherwise
+   it is recorded as `order_unknown` (§4).
+
+**Late webhooks.** A webhook older than the field's current value is
+still a real edit, so it goes into history. It is recorded as
+`superseded` only when the order is reliable: the field's `sf_time` is
+known (not NULL) and later than the webhook's `occurredAt`, both
+Salesforce times. Otherwise rule 3 applies.
 
 Rule 3 makes both sides converge: the portal ends up with the value
 Salesforce holds.
