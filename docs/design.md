@@ -581,7 +581,7 @@ rule 3 needs a read.
 
 | Case | Measured by |
 |---|---|
-| More user edits queued than we can send in time | oldest pending live edit: warn at 20 s, page at 30 s |
+| More live edits queued than we can send in time | oldest pending live edit: warning at 20 s, critical at 30 s (§11) |
 | Salesforce answers slowly | call duration p95: warn above 2 s |
 | Timeouts or HTTP 429 push past the quick retries | timeouts and 429s per minute |
 | Salesforce delivers webhooks late | webhook delivery lag: warn above 10 s |
@@ -1129,5 +1129,87 @@ about a tenth at quiet-hour rates. Without batch reads, recovery time
 is driven by **reads**; with them, by **our portal writes**. Batching
 writes (§1.2 q11) would shorten it further, but would change the
 per-record error handling in A17, so we do not count on it.
+
 ## 11. Three numbers to watch and alert thresholds
+
+These are the three primary alerts. The other measurements in §3
+(including the warning levels in its 30-second table) stay on
+`/metrics` and dashboards for diagnosis; they do not page. Per-record
+problems that need a person are listed separately in §11.2. **Warning** goes to the team channel
+and opens a ticket; **critical** pages the on-call engineer.
+
+| # | Metric | Warning | Critical | Why this one |
+|---|---|---|---|---|
+| 1 | **Age of the oldest pending live portal edit** (outbox, `live` priority) | > 20 s for 2 min | > 30 s for 2 min | the 30-second target, outbound |
+| 2 | **Age of the oldest unapplied inbound event** (inbox, not `failed`) | > 10 s for 2 min | > 60 s for 2 min, or any event marked `failed` | inbound is stuck, or an event needs a fix and replay (§5) |
+| 3 | **Salesforce API error and throttle rate** (429, 5xx and timeouts as a share of calls, last 5 min) | > 5% | > 25%, or outage mode entered (§10) | Salesforce is slowing or failing us; above 5% the retry assumption in §10 no longer holds |
+
+Metric 2 only covers webhooks that reach us. Webhooks that never
+arrive are caught by the sweep (§3 step 7), not by this alert.
+
+### 11.1 During a known Salesforce outage
+
+- Entering outage mode raises **one critical incident** (metric 3).
+  While it lasts, metric 1 and metric 3 do not page again: every edit
+  is pending by definition, so repeated pages would add nothing.
+- The incident is updated every hour with the backlog size and the
+  estimated drain time from §10.5's formula.
+- Metric 2 keeps alerting normally: inbound does not depend on the
+  Salesforce API.
+- When recovery starts, metric 1 applies to **live** edits again
+  straight away. The backlog has its own check: a warning if the
+  number of `backlog` rows has not gone down for 10 minutes.
+- The incident closes when the backlog and the recovery reads are
+  empty.
+
+### 11.2 Records that need a person
+
+Blocked and rejected records never alert silently and never disappear:
+
+| What | Where it shows | Alert |
+|---|---|---|
+| `blocked` outbox rows (§6) | portal: "not synced: Salesforce refused, being investigated"; operators: `GET /ops/sync-issues` | warning on any |
+| `rejected` fields (§6) | portal: Salesforce's message on the field; operators: `/ops/sync-issues` | none per field; daily count to the team |
+| `failed` inbox events (§5) | operators: `/ops/sync-issues`, with payload and error, replayable | critical on any (metric 2) |
+| fields flagged `conflict` (§7) | portal: shown to the user; operators: `/ops/sync-issues` | none; daily count |
+| placeholder customers > 5 min (§4.3) | operators: `/ops/sync-issues` | warning |
+
+`/ops/sync-issues` is a JSON endpoint over SQL views on the outbox,
+inbox and `field_state`, listing the record, the problem, the error
+and since when. It is not a user interface.
+
 ## 12. Out of scope this weekend
+
+Out of scope, as the brief allows:
+- deletes;
+- Salesforce login screens;
+- a visual user interface (the portal screens; we only describe what
+  the user is shown);
+- a second region;
+- a load test against real Salesforce;
+- a service we would ship.
+
+Left out by our choice, with where it is described:
+- **Initial load of the 5 million records**: an open question (§1.2
+  q13); if needed, a one-off bulk import, not designed here.
+- **Change Data Capture**: the preferred fallback for outage catch-up
+  (A3), not designed here.
+- **Batch writes** to Salesforce (§1.2 q11): they would change the
+  per-record error handling (A17).
+- **Several worker machines** and a shared rate limiter in Postgres
+  (§2.1): one worker is enough at this volume.
+- **Postgres high availability** (§2.5): a managed Postgres with
+  automatic failover is assumed, not designed.
+- **History retention and partitioning** (§1.2 q12).
+- **Webhook secret rotation** and access control for
+  `/ops/sync-issues`.
+- **New fields or objects** beyond the ones listed in the brief.
+- **An operator screen**: `/ops/sync-issues` returns JSON only.
+
+Still in scope, so not excluded: creates and updates on both sides,
+field-level merge of concurrent edits, kept history, the 30-second
+target and when it is missed, duplicate and out-of-order webhooks,
+the loop rule, the 6-hour outage with its arithmetic, and the rate
+limit with retries. A running program is optional in the brief; if
+we build one, it follows the build order in §3 against a fake
+Salesforce.
