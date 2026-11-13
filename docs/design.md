@@ -1,5 +1,66 @@
 # Design: Two-way sync of customer and contact records
 
+## Summary
+
+**What we build.** One service with two processes (an API process and a
+worker) and one Postgres database. Salesforce calls our webhook
+endpoint; the worker calls Salesforce's record API. The two processes
+share nothing but Postgres: an `inbox` table for what Salesforce sent,
+an `outbox` table for what we must send (§2). No Kafka or Redis.
+
+**Assumptions that matter most** (all 19 in §1, with what changes if
+each is wrong):
+- **A1** peak 10 portal edits/s and 20 Salesforce edits/s;
+- **A3** we can list records Salesforce changed since a time;
+- **A11 / A19** we can read records by ID, possibly many per call;
+- **A16** a `Portal_Write_Id__c` field marks each write we send;
+- **A13** Salesforce delivers webhooks within 20 s at worst.
+
+**The rules.**
+- **Different fields both survive:** we sync per field, never whole
+  records (§7).
+- **Which edit is current:** on a webhook, `occurredAt` against the
+  field's `sf_time`; on a portal save, the field's `version` (§7).
+- **Same field on both sides:** a portal edit made without seeing a
+  newer Salesforce value is not sent; when the order is unclear we
+  read Salesforce and take its current value. Every value stays in an
+  append-only history with `old_value`, `new_value`, actor, time and
+  outcome (§4, §7).
+- **Duplicate webhook:** the inbox key is `eventId`; a second delivery
+  changes nothing (§8).
+- **Out-of-order webhook:** each field is decided by Salesforce time;
+  an older event is kept in history as `superseded`; a tie or unknown
+  order means a read (§8).
+- **Loop:** applying a webhook never writes to the outbox, so no
+  webhook can cause a call to Salesforce. Our own write is recognised
+  by write ID **and** value (§9).
+- **6-hour outage:** every pending edit is already in Postgres. When
+  Salesforce returns we first list what it changed, read those records
+  before writing to them (Salesforce wins an unseen same-field
+  conflict; the portal edit stays in history), then drain (§10).
+
+**The numbers.**
+- **30 s worst case** while both are up: outbound 29.1 s, inbound
+  26.2 s, under the conditions C1–C5 in §3; outside them we detect
+  it, not promise it.
+- **Rate:** 80 of the 100 req/s; live edits first, backlog ≥ 50%,
+  recovery ≥ 20% of the current rate (A14).
+- **Outage scenario** (6 h at peak; 216,000 portal edits, 432,000
+  Salesforce edits): total elapsed recovery **~167 min** with one read
+  per record, **~58 min** with batch reads. Illustrative, not
+  guaranteed; the division is in §10.
+- **Alerts:** oldest pending live edit (critical 30 s), oldest
+  unapplied inbound event (critical 30 s), Salesforce error and
+  throttle rate (critical 25%) (§11).
+
+**Known limits.** A Salesforce change whose webhook has not reached us
+can be overwritten in a few-second window (longer in an outage); a
+read gives Salesforce's current value, not the history in between;
+a request Salesforce rejects without naming a field waits for an
+operator (§6, §7, §10).
+
+**Worked examples** are in [examples.md](examples.md).
+
 ## 1. Assumptions and open questions
 
 The brief is silent on these points. Each one has the assumption we
@@ -8,6 +69,30 @@ way. Section 1.2 lists the questions we would ask the client before we
 lock the design.
 
 ### 1.1 Assumptions
+
+| ID | Assumption, in short | If it is wrong |
+|---|---|---|
+| A1 | Peak 10 portal edits/s, 20 Salesforce edits/s | outage drain time scales with the rates |
+| A2 | Webhooks carry changed fields only | full records: compare values, age still decides |
+| A3 | We can list records changed since a time (Get Updated) | outage catch-up needs Change Data Capture or loses edits |
+| A4 | Stale portal save on the same field is rejected (`409`) | silent last-writer-wins; history still keeps both |
+| A5 | Portal actor and time from our server; order by per-field version | — (no ordering depends on our clock) |
+| A6 | We never compare our clock with Salesforce's | sides could disagree within the clock skew |
+| A7 | A dedicated integration user | own writes recognised by write ID or value only |
+| A8 | Salesforce retries webhooks for a limited time | catch-up runs more often |
+| A9 | Creates are upserts by external ID | a timed-out create can leave a duplicate |
+| A10 | Webhooks are signed (HMAC) | need an IP allowlist at least |
+| A11 | We can read one record by ID, with its last-modified time | unclear conflicts cannot be settled; catch-up depends on A3 fallbacks |
+| A12 | Salesforce field history is not available | we could recover more lost values |
+| A13 | Webhooks arrive within a few seconds, 20 s at worst | inbound 30 s cannot be met by us |
+| A14 | 80 req/s, shares, timeouts, retries, lease: configurable | budget numbers change, rules do not |
+| A15 | We can get Salesforce's validation rules | more `rejected` fields, nothing lost |
+| A16 | A `Portal_Write_Id__c` field on every write | match own writes by value (Option B) |
+| A17 | A Salesforce update is all-or-nothing per record | rejection must say which fields were saved |
+| A18 | `occurredAt` orders one record's changes, may tie | the sweep becomes the safety net |
+| A19 | Batch reads may be available | use the outage estimate without them |
+
+The full statement of each assumption follows.
 
 **A1. Peak edit rate.**
 Portal users make **10 edits/s at peak** and 1 edit/s in a quiet hour.
@@ -160,36 +245,6 @@ respected. Inbound events are tried **5 times** before they are marked
 failed. These are configuration values, not constants in code.
 *If different:* the budget in §3 changes; the rules do not.
 
-**A17. A Salesforce update is all-or-nothing per record.**
-If one field fails validation, none of the fields in that request are
-saved, and the error usually names the field.
-*If different (partial saves):* a rejection response would also have
-to tell us which fields were saved; we would mark those `synced` and
-treat the rest as below (§6).
-
-**A18. `occurredAt` orders changes to the same record, but may tie.**
-It comes from Salesforce's single clock, and for one record a later
-change has a later or equal `occurredAt`. We do **not** assume it is
-more precise than one second (the sample ends in `.000`), that it is
-exactly the save time, or that it can be compared with our clock
-(A6). When it cannot decide (a tie with different values, or
-`sf_time` NULL) we read the record (§8).
-*If different (changes to one record can be stamped out of order):*
-the age rule would sometimes keep the wrong value; the periodic sweep
-(A3) comparing against Salesforce's current values becomes the safety
-net. Change Data Capture (A3, fallback 1) carries a commit sequence
-number and would make ordering exact.
-
-**A19. We may be able to read many records in one call.**
-*Not in the brief.* Real Salesforce documents an sObject Collections
-retrieve (up to 2,000 records of one type per POST, about 800 per GET
-because of URL length), and counts it as one call toward its API
-limits. We do **not** know whether the client's 100 req/s cap counts
-it the same way, or what batch size is practical for them. §10 shows
-the outage both with and without it, using a batch size of **200 for
-illustration only**.
-*If different:* the outage estimate without batch reads applies.
-
 **A15. We can get the client's Salesforce validation rules and allowed
 values.**
 The Portal API checks the rules we know about before saving
@@ -219,6 +274,36 @@ user (A7) and value. If a field is sent again before the webhook for
 its previous write arrived, the match is ambiguous, so we leave that
 field's `sf_time` NULL. NULL is always safe: a later different value
 then costs one read (§7 rule 3).
+
+**A17. A Salesforce update is all-or-nothing per record.**
+If one field fails validation, none of the fields in that request are
+saved, and the error usually names the field.
+*If different (partial saves):* a rejection response would also have
+to tell us which fields were saved; we would mark those `synced` and
+treat the rest as below (§6).
+
+**A18. `occurredAt` orders changes to the same record, but may tie.**
+It comes from Salesforce's single clock, and for one record a later
+change has a later or equal `occurredAt`. We do **not** assume it is
+more precise than one second (the sample ends in `.000`), that it is
+exactly the save time, or that it can be compared with our clock
+(A6). When it cannot decide (a tie with different values, or
+`sf_time` NULL) we read the record (§8).
+*If different (changes to one record can be stamped out of order):*
+the age rule would sometimes keep the wrong value; the periodic sweep
+(A3) comparing against Salesforce's current values becomes the safety
+net. Change Data Capture (A3, fallback 1) carries a commit sequence
+number and would make ordering exact.
+
+**A19. We may be able to read many records in one call.**
+*Not in the brief.* Real Salesforce documents an sObject Collections
+retrieve (up to 2,000 records of one type per POST, about 800 per GET
+because of URL length), and counts it as one call toward its API
+limits. We do **not** know whether the client's 100 req/s cap counts
+it the same way, or what batch size is practical for them. §10 shows
+the outage both with and without it, using a batch size of **200 for
+illustration only**.
+*If different:* the outage estimate without batch reads applies.
 
 ### 1.2 Questions we would ask before locking the design
 
@@ -737,28 +822,11 @@ it, and queue a recovery read (A11) for the real values.
   then `is_placeholder` becomes false.
 - Measured: placeholders older than 5 minutes (§3 step 2).
 
-### 4.4 Example: one contact
+### 4.4 Example
 
-Contact `c-42`, Salesforce ID `0031A00000Abc`. Start: city Mumbai
-(version 3, `sf_time` 11:00:00, synced); phone with `sf_time`
-10:00:00.
-
-| # | Event | What is saved |
-|---|---|---|
-| 1 | Finance user sets city to **Noida** (11:30:02) | `contact.city` = Noida. `field_state` city: version 4, `pending`, `base_sf_time` 11:00:00. History #101: Mumbai → Noida, finance user, portal, `applied`. Outbox row created (write, live, pending) |
-| 2 | Same user sets city to **Gurgaon** before anything is sent | version 5. History #102: Noida → Gurgaon, `applied`. Outbox row already pending: unchanged. *One future call, two history rows.* |
-| 3 | Worker claims the row | Outbox: `in_flight`, `sent` = {city: v5 Gurgaon}, write ID W1, lease. Sends city = Gurgaon, `Portal_Write_Id__c` = W1 |
-| 4 | Call times out | Outbox: attempts 1, next attempt in 1 s. *No history row: a retry is not an edit.* |
-| 5 | Retry | Rule 1 re-checked. Fresh snapshot: still v5 Gurgaon; write ID W2. **Success.** city: `synced`, `sf_time` NULL, `sent_version` 5, `sent_write_id` W2. Outbox row deleted |
-| 6 | Webhook `evt_1001`: sales user sets phone (11:30:04) | Inbox row; `200`. Applied: phone's `sf_time` 10:00 is older, so phone updates. History #103: old → new phone, sales user, salesforce, `sf_time` 11:30:04, `evt_1001`, `applied`. *City untouched.* |
-| 7 | `evt_1001` again | Inbox insert does nothing; `200`. Nothing else written |
-| 8 | Webhook for attempt 1 (write ID W1, 11:30:08) | W1 ≠ `sent_write_id` W2: no state change, no history row. Kept in inbox |
-| 9 | Webhook for attempt 2 (W2, 11:30:09) | W2 matches, city is still version 5 and holds the value sent: `sf_time` = 11:30:09. No history row |
-| 10 | Late webhook `evt_0999`: sales user set city to Pune (11:29:50) | `sf_time` 11:30:09 is known and later: History #104: Pune, sales user, `sf_time` 11:29:50, **`superseded`**, `old_value` NULL. Current value stays Gurgaon |
-
-End state: the contact shows Gurgaon and the new phone; history has
-Noida, Gurgaon, the phone change and Pune, each with who and when; the
-outbox is empty; the inbox has four rows (the duplicate added none).
+One contact through a portal edit, a merge, a timed-out call and retry,
+a duplicate webhook, our own webhooks and a late Salesforce edit: see
+[examples.md, E1](examples.md#e1-one-contact-through-the-data-model).
 
 ## 5. Inbound path: webhook → Postgres
 
@@ -800,18 +868,7 @@ corrupt the others.
 safe at any time: the age rule and the write-ID match decide the
 outcome as if the event had just arrived late.
 
-**Example** (contact `c-77`):
-
-| # | Event | Result |
-|---|---|---|
-| 1 | `evt_2001` phone → X1, 10:00:00 | applied |
-| 2 | `evt_2001` again | ignored, `200` |
-| 3 | `evt_2003` phone → X3, 10:00:20 (arrives first) | applied, `sf_time` 10:00:20 |
-| 4 | `evt_2002` phone → X2, 10:00:10 (arrives later) | history `superseded`; phone stays X3 |
-| 5 | bad signature | `401`, nothing stored |
-| 6 | `evt_2004` while Postgres is down | `503`; stored when Salesforce resends |
-| 7 | `evt_2005` fails 5 times | `failed_at` set, alert; kept; replayed after the fix |
-| 8 | `evt_2006` for an unknown contact and customer | contact created; placeholder customer; read queued |
+**Example:** [examples.md, E2](examples.md#e2-inbound-cases).
 
 ## 6. Outbound path: portal edit → Salesforce API
 
@@ -852,19 +909,7 @@ portal and in history.
 is skipped at claim and tried again shortly; the customer's create is
 its own outbox row.
 
-**Example** (contact `c-42`):
-
-| # | Event | Result |
-|---|---|---|
-| 1 | save email = `bad@` | `422`, nothing saved |
-| 2 | save phone and city | `200`; both pending; one outbox row |
-| 3 | send phone, city (W1) → `429` | row kept; rate 80 → 40 req/s |
-| 4 | user also changes owner | owner pending; same outbox row |
-| 5 | retry phone, city, owner (W2) → timeout | attempts 2; if W2 landed, its webhook changes nothing |
-| 6 | newer Salesforce phone arrives | phone cancelled (§7 rule 1, `conflict`) |
-| 7 | retry city, owner (W3) → `400` naming `City` | city `rejected`; owner sent alone (W4) |
-| 8 | worker crashes after sending W4, before recording the result | lease runs out; W5 sends owner again (same value, harmless) → owner `synced`; only W5's webhook updates `sf_time` |
-| 9 | Salesforce unreachable | waits up to 60 s; oldest-pending alert; if it lasts, §10 |
+**Example:** [examples.md, E3](examples.md#e3-outbound-responses).
 
 ## 7. Rule: both sides change the same record
 
@@ -937,21 +982,12 @@ complete history: values we received a webhook for are in history
 (order possibly unknown); values we never received are missing (see
 the limitation below).
 
-**Worked example.** A finance user sets city to Noida. A sales user
-sets city to Delhi at about the same time.
-
-- *Delhi's webhook arrives before we send Noida.* Rule 1: Noida is not
-  sent. Delhi is current, Noida is in history, and the finance user
-  sees a conflict.
-- *Delhi is saved in Salesforce, but its webhook arrives after Noida
-  is sent.* Salesforce now holds Noida (last write wins there). Delhi's
-  webhook arrives while the field's `sf_time` is NULL, so rule 3 reads
-  the record: Noida. Delhi is recorded in history, the order of Delhi
-  and Noida is recorded as unknown, and the field is flagged as a
-  conflict.
+**Worked example** (Noida in the portal, Delhi in Salesforce, at about
+the same time): see [examples.md, E4](examples.md#e4-same-field-on-both-sides).
 
 **Limitation: a blind overwrite can lose a value from our history.**
-In the second case above, Delhi reaches our history *only because its
+In the second case of the worked example (E4), Delhi reaches our
+history *only because its
 webhook arrived*, even if late. If that webhook never arrives (for
 example during the 6-hour outage, when undelivered webhooks may be
 dropped), then Noida overwrites Delhi in Salesforce, the sweep reads
