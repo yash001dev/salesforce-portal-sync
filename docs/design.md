@@ -155,6 +155,19 @@ saved, and the error usually names the field.
 to tell us which fields were saved; we would mark those `synced` and
 treat the rest as below (§6).
 
+**A18. `occurredAt` orders changes to the same record, but may tie.**
+It comes from Salesforce's single clock, and for one record a later
+change has a later or equal `occurredAt`. We do **not** assume it is
+more precise than one second (the sample ends in `.000`), that it is
+exactly the save time, or that it can be compared with our clock
+(A6). When it cannot decide (a tie with different values, or
+`sf_time` NULL) we read the record (§8).
+*If different (changes to one record can be stamped out of order):*
+the age rule would sometimes keep the wrong value; the periodic sweep
+(A3) comparing against Salesforce's current values becomes the safety
+net. Change Data Capture (A3, fallback 1) carries a commit sequence
+number and would make ordering exact.
+
 **A15. We can get the client's Salesforce validation rules and allowed
 values.**
 The Portal API checks the rules we know about before saving
@@ -219,6 +232,9 @@ then costs one read (§7 rule 3).
     values, and who tells us when they change? (A15)
 16. Can the client add a `Portal_Write_Id__c` field to Customer and
     Contact, and will its changes appear in webhooks? (A16)
+17. When Salesforce resends a webhook, does it keep the same
+    `eventId`? How precise is `occurredAt`, and is it the time the
+    change was saved? (§8, A18)
 
 ## 2. Systems, who calls whom, network boundary, interfaces
 
@@ -489,8 +505,8 @@ rows (alert on any).
 
 ### Step 5: recognising our own write when it comes back
 **What:** the webhook for our own write is matched by its write ID
-(A16). For each field still at the version we sent with that ID, it
-fills in `sf_time` (NULL since the API response, §7 rule 2). A webhook
+(A16). For each field still at the version we sent with that ID and
+holding the value we sent, it fills in `sf_time` (NULL since the API response, §7 rule 2). A webhook
 with an older write ID changes no state. It is kept in the inbox and
 never sent back. Without the write ID we use Option B (A16): match by
 value, and leave `sf_time` NULL when unsure.
@@ -697,8 +713,8 @@ Refusing would make Salesforce resend or drop the whole event.
 
 **Applying, per field:**
 - **Duplicate** `eventId`: the inbox insert does nothing; reply `200`.
-- **Our own write** (carries a write ID, A16): fills in `sf_time`,
-  no history row (§9).
+- **Our own write** (write ID *and* value match, A16): fills in
+  `sf_time`, no history row (§9).
 - **Newer than the field's `sf_time`:** applied; history `applied`.
 - **Older, order reliable:** history `superseded`; current value kept
   (§8).
@@ -818,8 +834,11 @@ Three rules:
    cancel the send. The Salesforce value becomes current; its history
    row has outcome `conflict` and `old_value` = the cancelled portal
    value (whose own history row, written at save time, stays as it
-   is). The field is flagged as a conflict for the portal user. The same check runs again just before the
-   call is sent.
+   is). The field is flagged as a conflict for the portal user. The
+   same check runs again just before the call is sent. If
+   `base_sf_time` is NULL (the user edited after our own unconfirmed
+   write), any Salesforce value for that field that the user had not
+   seen counts as newer.
 2. **The API response means synced.** When the update call succeeds,
    the field becomes `synced` with `sf_time = NULL`. When the webhook
    for our own write arrives (§9), matched by its write ID (A16), we
@@ -890,7 +909,62 @@ retry overwrites their value. Rule 1 runs before every retry, so it
 catches this only if their webhook has already arrived.
 
 ## 8. Rule: duplicate and out-of-order webhooks
+
+**Duplicate.** The inbox key is `eventId`. A second delivery inserts
+nothing, applies nothing, writes no history, and gets `200`. This
+assumes a resend keeps its `eventId` (§1.2 q17). If it did not, the
+age rule below still prevents a wrong value (equal time, equal value
+changes nothing); the only cost would be a duplicate history row.
+
+**Out of order.** Each field of a webhook is decided on its own, by
+comparing `occurredAt` with the field's `sf_time` (both Salesforce
+times, A18):
+
+| Case | Result |
+|---|---|
+| `occurredAt` newer | applied |
+| `occurredAt` older, `sf_time` known | history `superseded`; current value kept |
+| `occurredAt` equal, same value | nothing changes |
+| `occurredAt` equal, different value | order unclear → read the record |
+| `sf_time` NULL, different value | order unclear → read the record |
+| field `pending` in the portal | §7 rule 1 first |
+
+Updates that arrive before the create, for a record we do not have,
+create it; the later create webhook's fields are `superseded`.
+
+**When the order is unclear we do not pick a winner.** We read the
+record (A11) and take Salesforce's current value. The webhook's value
+goes into history as `applied` if the read shows it, otherwise
+`order_unknown`. **A read gives us Salesforce's current value, not the
+missing edit history:** it cannot tell us the true order of the
+competing edits, or any value set and overwritten in between (§7).
+
 ## 9. Rule: stopping the sync loop
+
+Three layers. The first is enough on its own.
+
+1. **No path from inbound to outbound.** Applying a webhook never
+   writes to the outbox. Only a portal save through the Portal API
+   does, and there are no database triggers or portal automations
+   that save records in reaction to a change. So no webhook, ours or
+   anyone's, can cause a call to Salesforce.
+2. **Recognising our own write.** A field counts as our own write only
+   if the webhook carries its write ID (A16) **and** its value equals
+   what we sent. It then fills in `sf_time` and writes no history.
+   Getting this wrong never causes a loop; at worst it costs a read.
+3. **Salesforce automation.** A Flow or trigger may change a field in
+   the same save as our write (for example reformatting a phone
+   number). Its change arrives with our write ID but a different
+   value, so by layer 2 it is **not** our own write: it is a
+   Salesforce change and goes through the normal rules (§8, §7). In
+   particular, if a newer portal edit for that field is `pending`,
+   §7 rule 1 applies; the write ID does not let it overwrite the
+   pending edit blindly.
+
+**Measures:** synced fields whose `sf_time` stays NULL for more than
+5 minutes (our own webhooks not matching), and calls to Salesforce
+per portal save, not counting retries (should stay at or below 1; a
+rise would show a loop we did not foresee).
 ## 10. The 6-hour outage and the arithmetic
 ## 11. Three numbers to watch and alert thresholds
 ## 12. Out of scope this weekend
