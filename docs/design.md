@@ -141,9 +141,19 @@ we build; we can only detect and report it.
 Send at most **80 req/s** (20 below the cap, for safety). **Recovery
 work is guaranteed at least 20% of that (16 req/s)** whenever it has
 work waiting; capacity one class does not use goes to the other. Each
-Salesforce call has a **5-second timeout**. These are configuration
-values, not constants in code.
+Salesforce call has a **5-second timeout**. On HTTP 429 the limit is
+**halved** (80 → 40 req/s) and then raised by **5 req/s per minute**
+without another 429, back up to 80. A `Retry-After` header is always
+respected. Inbound events are tried **5 times** before they are marked
+failed. These are configuration values, not constants in code.
 *If different:* the budget in §3 changes; the rules do not.
+
+**A17. A Salesforce update is all-or-nothing per record.**
+If one field fails validation, none of the fields in that request are
+saved, and the error usually names the field.
+*If different (partial saves):* a rejection response would also have
+to tell us which fields were saved; we would mark those `synced` and
+treat the rest as below (§6).
 
 **A15. We can get the client's Salesforce validation rules and allowed
 values.**
@@ -256,7 +266,8 @@ shared limiter is a small token table in Postgres first.
 
 API process:
 1. Salesforce calls `POST /webhooks/salesforce`.
-2. Verify the signature (A10); check object type and field names.
+2. Verify the signature (A10); check the required keys. Fields we do
+   not sync are ignored, not refused (§5).
 3. Insert into `inbox` keyed by `eventId` (`ON CONFLICT DO NOTHING`);
    commit.
 4. Reply `200`, also for a duplicate, then `NOTIFY`.
@@ -271,7 +282,8 @@ Worker, in **one transaction**:
 5. **Never write to the outbox.**
 
 Any failure rolls the whole transaction back and the inbox row is
-tried again.
+tried again, up to 5 times; then it is marked failed and kept for
+replay (§5).
 
 ### 2.3 Outbound: portal save → Salesforce
 
@@ -309,8 +321,9 @@ Worker:
    - Timeout, `5xx`, `429`: attempt count + 1, next attempt time set,
      lease released. The next attempt takes a fresh snapshot and a
      new write ID.
-   - Other `4xx`: the sent fields become `rejected`; the row stops
-     (§3 step 4).
+   - Other `4xx`: named fields become `rejected` and the rest are
+     sent again; if no field is named, the row becomes `blocked`
+     (§6).
 
 The webhook for our own write later arrives on the inbound path and,
 if its write ID matches, fills in `sf_time` (§3 step 5).
@@ -351,7 +364,9 @@ automatic failover covers that; it is outside this weekend's scope.
 **Webhook endpoint** (Salesforce calls us)
 `POST /webhooks/salesforce`, a signature header (A10), body as in the
 brief's sample. Responses: `200` stored or duplicate · `401` bad
-signature · `400` malformed · `503` database down, please retry.
+signature · `400` malformed (invalid JSON, or a required key such as
+`eventId` or `recordId` missing) · `503` database down, please retry.
+Unknown fields are not a reason for `400`.
 
 **Portal save** (portal user calls us)
 `PATCH /records/:type/:id`, body `changedFields` plus, per field, the
@@ -367,7 +382,7 @@ versions · `409` per stale field, with its current value and actor ·
 - records modified since a time (A3).
 
 Responses: `2xx` done · `429` slow down, keep the work · timeout or
-`5xx` retry · other `4xx` rejected, no retry.
+`5xx` retry · other `4xx` rejected or blocked, no retry (§6).
 ## 3. Subproblems, in build order
 
 The order follows three questions: what is hardest to change later
@@ -443,14 +458,15 @@ guaranteed at least 16 req/s when it has work (A14).
 On timeout or failure: up to **2 quick retries** (after 1 s, then 2 s).
 After that the row stays in the outbox and retries with a growing wait
 (4 s, 8 s … up to 60 s), marked late. Nothing is dropped. On HTTP 429
-we slow down and keep the work.
+we halve the rate, respect `Retry-After`, and keep the work (A14).
 **Permanent rejection.** A `4xx` other than 429 (for example a
 Salesforce validation rule refusing a phone format) will not succeed
-on retry. The field becomes `rejected`, the outbox row stops, and the
-portal shows the user Salesforce's error so they can correct it; their
-correction is a normal new edit. We never undo the portal value
-automatically. Until it is corrected, the two sides differ on that
-field, and the field is visibly marked.
+on retry. If the error names the field, that field becomes `rejected`,
+the portal shows the user Salesforce's error so they can correct it,
+and the other fields are sent again without it. If the error names no
+field, we do not guess: the outbox row becomes **`blocked`**, all its
+fields stay `pending`, and we alert for investigation (§6). We never
+undo a portal value automatically.
 **Retry safety.** Updates set fields to fixed values, so sending the
 same update twice leaves the same state. Before every retry we re-run
 §7 rule 1 (cancel if a newer Salesforce value has arrived), and we
@@ -468,7 +484,8 @@ throttles us, and throttling causes more retries.
 timeouts per minute; Salesforce call duration (p95); age of the oldest
 waiting recovery item; rejections per hour (each one is investigated:
 it may be an outdated rule copy, A15, or a cause we cannot check, such
-as permissions or a rule that depends on other data).
+as permissions or a rule that depends on other data); blocked outbox
+rows (alert on any).
 
 ### Step 5: recognising our own write when it comes back
 **What:** the webhook for our own write is matched by its write ID
@@ -581,11 +598,14 @@ Index `(record_id, field, id)`.
 
 **`inbox`**: what Salesforce sent us.
 `event_id` (primary key: catches duplicates), `payload` (jsonb),
-`received_at`, `applied_at`, `attempts`, `last_error`.
+`received_at`, `applied_at`, `attempts`, `last_error`, `failed_at`
+(set after 5 failed attempts; the row is kept and can be replayed,
+§5).
 
 **`outbox`**: "this record has something to send". Key
 `(record_id, kind)`, where `kind` is `write` or `read`.
-`priority` (`user` / `recovery`), `state` (`pending` / `in_flight`),
+`priority` (`user` / `recovery`), `state` (`pending` / `in_flight` /
+`blocked`),
 `again` (bool), `sent` (jsonb: `{field: {version, value}}` and the
 write ID, set at claim), `attempts`, `next_attempt_at`, `lease_until`,
 `last_error`. It holds no values while pending.
@@ -665,7 +685,110 @@ End state: the contact shows Gurgaon and the new phone; history has
 Noida, Gurgaon, the phone change and Pune, each with who and when; the
 outbox is empty; the inbox has four rows (the duplicate added none).
 ## 5. Inbound path: webhook → Postgres
+
+The steps are in §2.2. This section covers what each case does.
+
+**Request checks.** Bad signature: `401`, nothing stored. Malformed
+(invalid JSON, missing `eventId` / `recordId` / `objectType` /
+`occurredAt`): `400`. Postgres down: `503`, so Salesforce resends.
+**Fields we do not sync are ignored, not refused**: the raw webhook is
+stored, the unknown field is counted, and the rest is applied.
+Refusing would make Salesforce resend or drop the whole event.
+
+**Applying, per field:**
+- **Duplicate** `eventId`: the inbox insert does nothing; reply `200`.
+- **Our own write** (carries a write ID, A16): fills in `sf_time`,
+  no history row (§9).
+- **Newer than the field's `sf_time`:** applied; history `applied`.
+- **Older, order reliable:** history `superseded`; current value kept
+  (§8).
+- **Order unclear** (`sf_time` NULL, different value): read the record
+  (§7 rule 3).
+- **Field pending in the portal:** §7 rule 1.
+- Applying never writes to the outbox (§9).
+
+**Unknown records.** A webhook for a record we do not have creates it,
+with its `sf_id`. A customer it names that we do not have becomes a
+placeholder, with a recovery read queued (§4.3).
+
+**Failed events are kept and can be replayed.** If applying an event
+keeps failing (a bug, an unexpected value), it is retried with a
+growing wait. After **5 attempts** it gets `failed_at`, an alert goes
+out, and it stays in the inbox with its payload and `last_error`.
+Failed events are never deleted. Other events keep being applied:
+the age rule does not need events in order, so skipping one does not
+corrupt the others.
+**Replay:** once the cause is fixed, a command (`npm run replay --
+<eventId>`, or `--all-failed`) clears `failed_at` and resets
+`attempts`, and the worker applies the event normally. Replaying is
+safe at any time: the age rule and the write-ID match decide the
+outcome as if the event had just arrived late.
+
+**Example** (contact `c-77`):
+
+| # | Event | Result |
+|---|---|---|
+| 1 | `evt_2001` phone → X1, 10:00:00 | applied |
+| 2 | `evt_2001` again | ignored, `200` |
+| 3 | `evt_2003` phone → X3, 10:00:20 (arrives first) | applied, `sf_time` 10:00:20 |
+| 4 | `evt_2002` phone → X2, 10:00:10 (arrives later) | history `superseded`; phone stays X3 |
+| 5 | bad signature | `401`, nothing stored |
+| 6 | `evt_2004` while Postgres is down | `503`; stored when Salesforce resends |
+| 7 | `evt_2005` fails 5 times | `failed_at` set, alert; kept; replayed after the fix |
+| 8 | `evt_2006` for an unknown contact and customer | contact created; placeholder customer; read queued |
+
 ## 6. Outbound path: portal edit → Salesforce API
+
+The steps are in §2.3. This section covers what each response does.
+
+**Before saving.** Known Salesforce rules (A15) are checked; a failure
+returns `422` and nothing is saved. A stale field returns `409` (A4).
+
+**Each Salesforce response:**
+
+| Response | What we do |
+|---|---|
+| `2xx` | Fields still at the sent version become `synced` (`sf_time` NULL). Row deleted, or back to pending if `again` |
+| `429` | Keep the row. Halve the rate, respect `Retry-After`, raise again slowly (A14) |
+| Timeout, `5xx`, unreachable | Keep the row; 2 quick retries, then a growing wait up to 60 s. Each attempt takes a fresh snapshot and a new write ID; §7 rule 1 is re-checked first |
+| `4xx` naming field(s) | Those fields become `rejected` (history row with exactly what we sent; the user sees Salesforce's message on the field). The **other fields are sent again at once** without them |
+| `4xx` naming no field | **Blocked** (below) |
+
+**One invalid field in a multi-field update.** A Salesforce update is
+all-or-nothing per record (A17), so when it is rejected nothing in it
+was saved. Nothing is lost on our side either: every value is in the
+portal and in history.
+- If the error names the field, only that field is `rejected`; the
+  rest go through in the next call.
+- If the error names no field (a whole-record rule, for example "a
+  closed customer needs an owner"), **we do not guess** and do not
+  send fields one by one, which could leave Salesforce holding a mix
+  of the user's changes. The outbox row becomes **`blocked`**: no
+  more retries, all its fields stay `pending` with their values and
+  history, and an alert goes out. The portal shows the record as
+  "not synced: Salesforce refused, being investigated".
+- New portal edits to a blocked record are saved as usual and stay
+  pending with it. An operator unblocks the row once the cause is
+  understood; the next attempt sends the current pending values.
+  Salesforce edits to those fields still follow §7 rule 1.
+
+**Waiting on a customer.** A contact whose customer has no `sf_id` yet
+is skipped at claim and tried again shortly; the customer's create is
+its own outbox row.
+
+**Example** (contact `c-42`):
+
+| # | Event | Result |
+|---|---|---|
+| 1 | save email = `bad@` | `422`, nothing saved |
+| 2 | save phone and city | `200`; both pending; one outbox row |
+| 3 | send phone, city (W1) → `429` | row kept; rate 80 → 40 req/s |
+| 4 | user also changes owner | owner pending; same outbox row |
+| 5 | retry phone, city, owner (W2) → timeout | attempts 2; if W2 landed, its webhook changes nothing |
+| 6 | newer Salesforce phone arrives | phone cancelled (§7 rule 1, `conflict`) |
+| 7 | retry city, owner (W3) → `400` naming `City` | city `rejected`; owner sent alone (W4) |
+| 8 | worker crashes after sending W4, before recording the result | lease runs out; W5 sends owner again (same value, harmless) → owner `synced`; only W5's webhook updates `sf_time` |
+| 9 | Salesforce unreachable | waits up to 60 s; oldest-pending alert; if it lasts, §10 |
 ## 7. Rule: both sides change the same record
 
 **Different fields: both survive.** We sync per field, never whole
