@@ -1,12 +1,19 @@
 # Salesforce ↔ Portal two-way sync
 
 ## What this is
-This repo designs a two-way sync between Salesforce and the Tequity portal.
-The goal is to ensure that data is consistent across both platforms, allowing for seamless integration and improved user experience.
+This repo designs a two-way sync of customer and contact records between
+Salesforce and the Tequity portal.
 
-## Contents
-- docs/design.md: design document (starts with a one-page summary)
-- docs/examples.md: worked examples referenced from the design
+## Read this first
+**[docs/design-concise.md](docs/design-concise.md)**: the primary
+design document (about 5 pages), following the brief's outline.
+
+## Supporting references
+- [docs/design.md](docs/design.md): the full design, with the reasoning
+  behind each decision, all assumptions and questions, and the
+  step-by-step arithmetic.
+- [docs/examples.md](docs/examples.md): worked examples referenced from
+  the design.
 
 ## Status
-Design in progress.
+Design complete. No code (optional in the brief).
