@@ -120,8 +120,11 @@ we would at least need an IP allowlist.
 **A11. We can read one record from Salesforce by ID.**
 *Another API the brief does not give us* (it names only create and
 update). We use it in two places: to fetch values for IDs returned by
-A3, and to settle a conflict when we cannot tell the order (§7). Each
-read counts against the 100 req/s cap.
+A3, and to settle a conflict when we cannot tell the order (§7). We
+also assume the read returns the record's last-modified time, so the
+values we apply from it get an `sf_time` (without it they stay NULL,
+which is safe but costs later reads). Each read counts against the
+100 req/s cap.
 *If different:* we cannot settle unclear conflicts by asking
 Salesforce, and outage catch-up depends entirely on the A3 fallbacks.
 
@@ -138,9 +141,14 @@ Webhook delivery time is outside our control, but it is part of the
 we build; we can only detect and report it.
 
 **A14. Starting numbers, to be tuned in production.**
-Send at most **80 req/s** (20 below the cap, for safety). **Recovery
-work is guaranteed at least 20% of that (16 req/s)** whenever it has
-work waiting; capacity one class does not use goes to the other. Each
+Send at most **80 req/s** (20 below the cap, for safety). Outbox work
+has three priorities: **live** (user edits made while Salesforce is
+up), **backlog** (user edits made during an outage) and **recovery**
+(reads, sweep, bulk changes). Live is served first. **Backlog is
+guaranteed at least 50% and recovery at least 20% of the *current*
+rate** (so 40 and 16 req/s at 80; 20 and 8 req/s after a 429 halves it
+to 40). Capacity one priority does not use is borrowed by the others.
+Each
 Salesforce call has a **5-second timeout**. On HTTP 429 the limit is
 **halved** (80 → 40 req/s) and then raised by **5 req/s per minute**
 without another 429, back up to 80. A `Retry-After` header is always
@@ -167,6 +175,16 @@ the age rule would sometimes keep the wrong value; the periodic sweep
 (A3) comparing against Salesforce's current values becomes the safety
 net. Change Data Capture (A3, fallback 1) carries a commit sequence
 number and would make ordering exact.
+
+**A19. We may be able to read many records in one call.**
+*Not in the brief.* Real Salesforce documents an sObject Collections
+retrieve (up to 2,000 records of one type per POST, about 800 per GET
+because of URL length), and counts it as one call toward its API
+limits. We do **not** know whether the client's 100 req/s cap counts
+it the same way, or what batch size is practical for them. §10 shows
+the outage both with and without it, using a batch size of **200 for
+illustration only**.
+*If different:* the outage estimate without batch reads applies.
 
 **A15. We can get the client's Salesforce validation rules and allowed
 values.**
@@ -235,6 +253,8 @@ then costs one read (§7 rule 3).
 17. When Salesforce resends a webhook, does it keep the same
     `eventId`? How precise is `occurredAt`, and is it the time the
     change was saved? (§8, A18)
+18. Can we read many records in one call, and does the client's
+    100 req/s cap count such a call as one request? (A19)
 
 ## 2. Systems, who calls whom, network boundary, interfaces
 
@@ -319,7 +339,7 @@ Commit, then `NOTIFY`.
 
 Worker:
 1. **Claim (short transaction).** Pick a pending outbox row; user
-   edits first, recovery guaranteed 20% (A14). Skip a contact whose
+   priorities and shares as in A14. Skip a contact whose
    customer has no Salesforce ID yet (it waits for the customer's own
    create). Take a rate-limit slot. Read the record's **current**
    pending fields and store exactly what will be sent on the row:
@@ -456,15 +476,15 @@ sends outbox rows to Salesforce.
   sets `again`, and the row goes back to pending once the call ends.
   The worker records exactly what it sent (§2.3). Merging never
   touches history: each save writes its own history rows (§4).
-- Two priorities: **user edits**, and **recovery work** (catch-up
-  reads, sweep, bulk changes).
+- Three priorities: **live**, **backlog** and **recovery**, with
+  guaranteed shares (A14, §10).
 - Creates are sent as upserts by external ID (A9).
 **Why here:** it is the only way pending calls survive a restart, and
 the rate limiter (step 4) needs something to control.
 **If skipped:** writing to Postgres and calling Salesforce directly
 means a crash between the two loses the edit, or sends it without
 saving it; during an outage pending calls live only in memory.
-**Measures:** age of the oldest pending user edit (the 30-second
+**Measures:** age of the oldest pending live edit (the 30-second
 number); outbox size per priority.
 
 ### Step 4: rate limiter and retries
@@ -525,8 +545,9 @@ edit silently overwrites a Salesforce edit.
 **Measures:** conflicts per hour.
 
 ### Step 7: recovery (sweep, outage catch-up, backlog drain)
-**What:** the drain is the step 3 worker at the step 4 limit. Catch-up
-and the sweep use A3 and A11 and feed results through the **same apply
+**What:** the drain is the step 3 worker at the step 4 limit, with the
+backlog priority and the read-before-write check (§10). Catch-up and
+the sweep use A3 and A11 and feed results through the **same apply
 path as webhooks** (step 2).
 **Why last:** it reuses everything above; building it first would
 create a second apply path that drifts from the first.
@@ -546,7 +567,7 @@ guarantee. Our own outbound steps are budgeted as follows:
 | Save + history + outbox commit | < 0.1 s | one transaction |
 | Worker notices the row | ≤ 1 s | `LISTEN/NOTIFY`, 1 s poll as backup |
 | Earlier call on the same record finishes | ≤ 5 s | one call per record, 5 s timeout |
-| Queue wait | ≤ 5 s | ≥ 64 req/s for user edits, so up to ~320 edits ahead |
+| Queue wait | ≤ 5 s | live edits are served first; at ≥ 64 req/s up to ~320 live edits ahead |
 | Call plus 2 quick retries | ≤ 18 s | 5 + 1 + 5 + 2 + 5 |
 | **Total** | **≈ 29 s** | |
 
@@ -560,16 +581,18 @@ rule 3 needs a read.
 
 | Case | Measured by |
 |---|---|
-| More user edits queued than we can send in time | oldest pending user edit: warn at 20 s, page at 30 s |
+| More user edits queued than we can send in time | oldest pending live edit: warn at 20 s, page at 30 s |
 | Salesforce answers slowly | call duration p95: warn above 2 s |
 | Timeouts or HTTP 429 push past the quick retries | timeouts and 429s per minute |
 | Salesforce delivers webhooks late | webhook delivery lag: warn above 10 s |
 | Draining the backlog after an outage | separate target (§10); backlog size over time |
 
-During a drain, queued portal edits are sent oldest first; a new edit
-to a record already queued merges into that item, and a new edit to
-any other record waits its turn. The 30-second target is suspended
-until the backlog is gone.
+After an outage, edits made during it go to the **backlog** priority;
+new edits go to **live** and are served first, so they return to the
+30-second target almost at once (§10). A new edit to a record already
+in the backlog moves that record to live. If the record is one
+Salesforce changed during the outage, it still gets its one read
+before the write (§10).
 ## 4. Data we store
 
 Seven tables, all in Postgres.
@@ -620,7 +643,7 @@ Index `(record_id, field, id)`.
 
 **`outbox`**: "this record has something to send". Key
 `(record_id, kind)`, where `kind` is `write` or `read`.
-`priority` (`user` / `recovery`), `state` (`pending` / `in_flight` /
+`priority` (`live` / `backlog` / `recovery`), `state` (`pending` / `in_flight` /
 `blocked`),
 `again` (bool), `sent` (jsonb: `{field: {version, value}}` and the
 write ID, set at claim), `attempts`, `next_attempt_at`, `lease_until`,
@@ -966,5 +989,145 @@ Three layers. The first is enough on its own.
 per portal save, not counting retries (should stay at or below 1; a
 rise would show a loop we did not foresee).
 ## 10. The 6-hour outage and the arithmetic
+
+### 10.1 The scenario
+
+The Salesforce API is unreachable for **6 h = 21,600 s**. Webhooks
+Salesforce tries to send in that window are lost. The numbers below
+are an **illustrative scenario, not a worst-case guarantee**:
+
+- peak rates for the whole 6 hours: **10 portal edits/s, 20 Salesforce
+  edits/s** (A1);
+- every edit is to a different record (merging would only help);
+- **5% of calls fail once and are retried** (assumption);
+- portal and Salesforce users edit independent records (assumption,
+  used only to estimate the overlap).
+
+### 10.2 What is on disk during the outage
+
+| In Postgres | After 6 h |
+|---|---|
+| Portal edits saved, with history rows | 10 × 21,600 = **216,000** |
+| Outbox rows (one per record, no values) | ≤ **216,000** |
+| Pending fields in `field_state`, with the value the user saw (the `old_value` of the edit's history row) | one per edited field |
+| `sync_cursor` | the last time Salesforce was fully read (about the outage start) |
+
+Every row was written in the same transaction as the user's save, so
+restarting our processes loses nothing. The portal keeps working;
+saves show "pending sync".
+
+**Outage mode.** After 1 minute of failed calls the worker stops
+sending and makes one test call every 30 s. When a test call succeeds,
+all user rows in the outbox are tagged **`backlog`**, and recovery
+starts.
+
+### 10.3 Recovery, in order
+
+**Step A: find what Salesforce changed (before sending anything).**
+Get Updated (A3) from `sync_cursor` − 1 minute to now, for Customer
+and Contact, in 10-minute windows: 36 windows × 2 types = **72
+calls**. Result: the set **C** of records changed in Salesforce,
+worst case 20 × 21,600 = **432,000**. Every outbox row whose record is
+in C is marked **read before write**.
+
+**Step B: drain the portal backlog safely.**
+- Record **not in C**: Salesforce did not change it, so nothing can be
+  overwritten. Send it.
+- Record **in C**: read it first (A11 or A19), then per pending field:
+  - Salesforce value = the value the user saw → Salesforce did not
+    change this field → send ours;
+  - different → Salesforce changed it unseen → **Salesforce wins**
+    (§7 rule 1): a `conflict` history row, the user is notified, our
+    edit is not sent and stays in history.
+
+**Step C: bring in the rest of C.** Records changed in Salesforce but
+not in the outbox are read and applied through the normal apply path
+(recovery priority).
+
+**Throughout: new edits and late changes.**
+- New portal edits go to **live**, which is served first, so they get
+  back to the 30-second target almost at once. A new edit to a backlog
+  record moves that record to live. **If the record is in C, its
+  read-before-write check still runs first.**
+- Shares (A14) apply to the **current** rate: backlog is guaranteed
+  50%, recovery 20%; unused capacity is borrowed by the others. So
+  after a 429 halves the rate to 40 req/s, backlog keeps ≥ 20 and
+  recovery ≥ 8.
+- Salesforce webhooks flow again and are applied as usual; §7 rule 1
+  runs before every send.
+- **Get Updated runs every 5 minutes** during recovery, over the
+  window since the last run with a 1-minute overlap (2 calls per run).
+  New IDs join C. This **reduces** the risk of missing a Salesforce
+  change made during the drain whose webhook is late or lost; it does
+  **not** eliminate the blind window: a change made in the seconds
+  before we send can still be overwritten (§7 limitation).
+
+**What reconciliation cannot recover.** A read shows Salesforce's
+current value, not the edits in between. If Salesforce changed a field
+and changed it back (A → B → A), the read looks unchanged, we send our
+value, and B is not in our history.
+
+### 10.4 The calls needed
+
+| Work | Calls |
+|---|---|
+| Get Updated (step A) | 72 |
+| Portal writes from the outage | **216,000** |
+| Reads for records in both the outbox and C | 216,000 × 432,000 / 5,000,000 ≈ **18,662** |
+| Reads for the rest of C | 432,000 − 18,662 = **413,338** |
+| **Total, one read per record** | **648,072** |
+
+(If the overlap were larger, the total would not change; those reads
+would just move from recovery to backlog.)
+
+### 10.5 Rate available
+
+- Budget 80 req/s; with 5% retries, useful = rate ÷ 1.05.
+- Live edits keep arriving at 10/s → 10 × 1.05 = **10.5 req/s**.
+- Left: 80 − 10.5 = 69.5 req/s. Recovery gets its guaranteed 16;
+  backlog gets the rest, 53.5 (above its 40 guarantee).
+- Useful: **backlog 53.5 ÷ 1.05 = 50.95/s**, **recovery 16 ÷ 1.05 =
+  15.24/s**. When one finishes, the other gets all 69.5 ÷ 1.05 =
+  **66.2/s**.
+
+General form, for other numbers:
+
+> **time = calls ÷ (current rate ÷ (1 + retry share) − live edits/s)**
+
+### 10.6 Drain times
+
+**Without batch reads (one read per record):**
+- Backlog: (216,000 + 18,662) ÷ 50.95 = 234,662 ÷ 50.95 = 4,606 s
+  ≈ **77 min**.
+- Recovery while the backlog runs: 15.24 × 4,606 ≈ 70,179 reads done;
+  413,338 − 70,179 = 343,159 left ÷ 66.2 ≈ 5,184 s ≈ **86 min** more.
+- Salesforce's outage changes are all in the portal after
+  77 + 86 ≈ **163 min**.
+
+**With batch reads (A19, 200 per call, illustration):**
+- Reads: 432,000 ÷ 200 = **2,160 calls** (≈ 93 of them for the
+  overlap, in backlog).
+- Recovery: ≈ 2,067 calls ÷ 15.24 ≈ 136 s ≈ **2.3 min**.
+- Backlog: 136 s × 50.95 ≈ 6,910 calls done; (216,000 + 93 − 6,910)
+  = 209,183 left ÷ 66.2 ≈ 3,160 s; total 136 + 3,160 ≈ 3,296 s
+  ≈ **55 min**.
+
+### 10.7 Elapsed recovery time
+
+| | Without batch reads | With batch reads (illustrative) |
+|---|---|---|
+| (a) Initial reconciliation (step A: 72 calls, run in sequence, plus marking rows) | ~2 min | ~2 min |
+| (b) Portal backlog drained into Salesforce | ~77 min | ~55 min |
+| Salesforce's outage changes in the portal | ~163 min | ~2–3 min |
+| **(c) Total elapsed, from Salesforce coming back** | **~2 + 163 ≈ 165 min (≈ 2 h 45 min)** | **~2 + 55 ≈ 57 min** |
+| New edits after recovery starts | ~30 s target (+1 read if the record is in C) | same |
+
+These are **illustrative estimates, not guarantees**. They grow in
+proportion to edit rates and outage length, roughly double if
+Salesforce throttles us to half rate during the drain, and fall to
+about a tenth at quiet-hour rates. Without batch reads, recovery time
+is driven by **reads**; with them, by **our portal writes**. Batching
+writes (§1.2 q11) would shorten it further, but would change the
+per-record error handling in A17, so we do not count on it.
 ## 11. Three numbers to watch and alert thresholds
 ## 12. Out of scope this weekend
